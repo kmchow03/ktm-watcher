@@ -1,0 +1,21 @@
+# KTM Shuttle Tebrau seat watcher - settings
+# Your Telegram details are NOT kept here; they are GitHub secrets.
+[telegram]
+
+[settings]
+passengers = 1
+date_format = "%d %b %Y"
+
+# SG_TO_JB = Woodlands -> JB Sentral,  JB_TO_SG = JB Sentral -> Woodlands
+
+[[watch]]
+direction = "SG_TO_JB"
+date      = "2026-10-03"
+earliest  = "08:00"
+latest    = "12:00"
+
+[[watch]]
+direction = "JB_TO_SG"
+date      = "2026-10-03"
+earliest  = "17:00"
+latest    = "22:00"
