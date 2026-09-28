@@ -309,34 +309,66 @@ def save_debug(page: Page, tag: str) -> Path:
     return shot
 
 
+JS_KTMB_SEARCH = r"""
+([want, dateText]) => {
+  // Uses KTMB's own page functions (SwapFromToTerminal, SearchTrip).
+  const from = document.getElementById('FromStationId');
+  const date = document.getElementById('OnwardDate');
+  if (!from || !date || typeof SearchTrip !== 'function') return 'no-form';
+  const norm = v => /woodlands/i.test(v) ? 'WOODLANDS' : (/jb|johor/i.test(v) ? 'JB SENTRAL' : v);
+  if (norm(from.value) !== want && typeof SwapFromToTerminal === 'function') SwapFromToTerminal();
+  if (norm(from.value) !== want) return 'no-swap:' + from.value;
+  date.value = dateText;
+  const pax = document.getElementById('PassengerCount'); if (pax) pax.value = '1';
+  SearchTrip();
+  return 'ok';
+}
+"""
+
+JS_KTMB_STATUS = r"""
+() => {
+  const rows = document.querySelectorAll('tbody.depart-trips tr');
+  // Any KTMB pop-up message that's showing
+  const msgs = [...document.querySelectorAll('.modal.show, .modal[style*="block"], .jconfirm, .swal2-popup, .alert-danger, [role=alertdialog]')]
+    .map(e => e.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  return { rows: rows.length, msgs, url: location.href, title: document.title,
+           text: document.body ? document.body.innerText.replace(/\s+/g, ' ').slice(0, 400) : '' };
+}
+"""
+
+
 def check_trip(page: Page, w: dict, pax: int, date_fmt: str) -> list[dict]:
     page.goto(SHUTTLE_URL, wait_until="domcontentloaded", timeout=45000)
     try:
-        page.wait_for_load_state("networkidle", timeout=20000)
+        page.wait_for_function("typeof SearchTrip === 'function' && !!document.getElementById('OnwardDate')", timeout=25000)
     except PWTimeout:
-        pass
-    dismiss_popups(page)
-    ensure_direction(page, w["direction"])
-    values = page.evaluate(JS_SET_DATE, [w["date"].isoformat(), w["date"].strftime(date_fmt)])
-    if not values or not any(values):
-        raise SetupError("Couldn't fill in the departure date.")
-    set_pax(page, pax)
-    click_search(page)
-    try:
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except PWTimeout:
-        pass
-    page.wait_for_timeout(1500)
-    dismiss_popups(page)
-    res = page.evaluate(JS_PARSE)
-    if not res["trips"] and not res.get("noTrips"):
-        shot = save_debug(page, f"{w['direction']}-{w['date']}")
-        raise SetupError(f"Searched, but couldn't read the results. Screenshot saved: {shot.name}")
+        shot = save_debug(page, f"{w['direction']}-{w['date']}-form")
+        st = page.evaluate(JS_KTMB_STATUS)
+        raise SetupError(f"KTMB search form didn't load. Page title: {st['title']!r}. Text: {st['text'][:200]!r}")
+    date_text = f"{w['date'].day} {w['date']:%b %Y}"   # KTMB uses e.g. "3 Oct 2026"
+    res = page.evaluate(JS_KTMB_SEARCH, [STATIONS[w["direction"]][0], date_text])
+    if res != "ok":
+        raise SetupError(f"Couldn't fill in the KTMB search form ({res}).")
+    page.wait_for_url("**/ShuttleTrip**", timeout=30000)
+    st = None
+    for _ in range(40):  # up to ~30s for the train list to load
+        page.wait_for_timeout(750)
+        st = page.evaluate(JS_KTMB_STATUS)
+        if st["rows"] or st["msgs"]:
+            break
+    if not st["rows"]:
+        save_debug(page, f"{w['direction']}-{w['date']}")
+        if st["msgs"]:
+            raise SetupError("KTMB said: " + " | ".join(st["msgs"])[:300])
+        raise SetupError(f"No train list appeared. Page: {st['url']} Text: {st['text'][:250]!r}")
+    trips = page.evaluate(JS_PARSE)["trips"]
     lo, hi = w["earliest"], w["latest"]
-    trips = [t for t in res["trips"] if lo <= t["time"].zfill(5) <= hi]
+    out = []
     for t in trips:
         t["time"] = t["time"].zfill(5)
-    return sorted(trips, key=lambda t: t["time"])
+        if lo <= t["time"] <= hi:
+            out.append(t)
+    return sorted(out, key=lambda t: t["time"])
 
 
 # ----------------------------------------------------------------------------- main loop
