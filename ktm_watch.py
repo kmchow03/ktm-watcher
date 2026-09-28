@@ -38,6 +38,16 @@ SHUTTLE_URL = "https://shuttleonline.ktmb.com.my/Home/Shuttle"
 STATIONS = {"SG_TO_JB": ("WOODLANDS", "JB SENTRAL"), "JB_TO_SG": ("JB SENTRAL", "WOODLANDS")}
 PRETTY = {"SG_TO_JB": "Woodlands → JB Sentral", "JB_TO_SG": "JB Sentral → Woodlands"}
 MIN_INTERVAL_MIN = 3  # be polite to KTMB's servers
+try:
+    from zoneinfo import ZoneInfo
+    SGT = ZoneInfo("Asia/Singapore")
+except Exception:  # pragma: no cover
+    from datetime import timezone, timedelta
+    SGT = timezone(timedelta(hours=8))
+
+
+def now_sg() -> datetime:
+    return datetime.now(SGT)
 
 
 class SetupError(Exception):
@@ -57,9 +67,7 @@ def load_config(path: Path) -> dict:
         cfg["telegram"]["bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"].strip()
     if os.environ.get("TELEGRAM_CHAT_ID"):
         cfg["telegram"]["chat_id"] = os.environ["TELEGRAM_CHAT_ID"].strip()
-    watches = cfg.get("watch", [])
-    if not watches:
-        sys.exit("No [[watch]] entries in config.toml — add at least one trip to watch.")
+    watches = cfg.setdefault("watch", [])
     for i, w in enumerate(watches, 1):
         d = str(w.get("direction", "")).upper()
         if d not in STATIONS:
@@ -371,44 +379,234 @@ def check_trip(page: Page, w: dict, pax: int, date_fmt: str) -> list[dict]:
     return sorted(out, key=lambda t: t["time"])
 
 
-# ----------------------------------------------------------------------------- main loop
 def describe(w: dict) -> str:
     return f"{PRETTY[w['direction']]} on {w['date']:%a %d %b} ({w['earliest']}–{w['latest']})"
 
 
+# ----------------------------------------------------------------------------- telegram commands
+HELP = """🚆 KTM seat bot commands
+(I check about every 10–15 minutes, so replies can take a little while.)
+
+/check 3 Oct SG — seats on every train that day
+/watch 3 Oct SG — alert me when any train that day gets seats
+/watch 3 Oct JB 17:00-22:00 — only trains in that time window
+/list — what I'm watching
+/stop 2 — stop watching number 2 from /list
+
+SG = Woodlands → JB Sentral
+JB = JB Sentral → Woodlands
+Dates: 3 Oct, 3/10, 2026-10-03, today, tomorrow"""
+
+MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def parse_date(tokens: list[str]) -> tuple[date | None, list[str]]:
+    """Read a date from the start of tokens. Returns (date, remaining tokens)."""
+    today = now_sg().date()
+    if not tokens:
+        return None, tokens
+    t0 = tokens[0].lower()
+    if t0 == "today":
+        return today, tokens[1:]
+    if t0 in ("tomorrow", "tmr", "tml"):
+        return date.fromordinal(today.toordinal() + 1), tokens[1:]
+    try:
+        return date.fromisoformat(t0), tokens[1:]
+    except ValueError:
+        pass
+    m = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?", t0)
+    if m:
+        d, mo, y = int(m[1]), int(m[2]), m[3]
+        rest = tokens[1:]
+    elif re.fullmatch(r"\d{1,2}", t0) and len(tokens) > 1 and tokens[1][:3].lower() in MONTHS:
+        d, mo = int(t0), MONTHS[tokens[1][:3].lower()]
+        y, rest = None, tokens[2:]
+        if rest and re.fullmatch(r"\d{4}", rest[0]):
+            y, rest = rest[0], rest[1:]
+    else:
+        return None, tokens
+    try:
+        if y:
+            yy = int(y) + (2000 if len(y) == 2 else 0)
+            return date(yy, mo, d), rest
+        cand = date(today.year, mo, d)
+        if cand < today:
+            cand = date(today.year + 1, mo, d)
+        return cand, rest
+    except ValueError:
+        return None, tokens
+
+
+def parse_dir(tok: str | None) -> str | None:
+    if not tok:
+        return None
+    t = tok.lower()
+    if t in ("sg", "sin", "singapore", "woodlands", "wdl", "sg>jb", "sg-jb", "sg_to_jb"):
+        return "SG_TO_JB"
+    if t in ("jb", "jbs", "johor", "sentral", "jb>sg", "jb-sg", "jb_to_sg"):
+        return "JB_TO_SG"
+    return None
+
+
+def parse_window(tok: str | None) -> tuple[str, str] | None:
+    if not tok:
+        return ("00:00", "23:59")
+    m = re.fullmatch(r"(\d{1,2})[:.]?(\d{2})?\s*-\s*(\d{1,2})[:.]?(\d{2})?", tok)
+    if not m:
+        return None
+    a = f"{int(m[1]):02d}:{m[2] or '00'}"
+    b = f"{int(m[3]):02d}:{m[4] or '00'}"
+    if b == "24:00":
+        b = "23:59"
+    return (a, b)
+
+
+def watch_id(w: dict) -> str:
+    return f"{w['direction']}|{w['date']}|{w['earliest']}|{w['latest']}"
+
+
+def all_watches(cfg: dict, state: dict) -> list[dict]:
+    """Trips from config.toml (minus ones stopped via Telegram) plus trips added via Telegram."""
+    muted = set(state.get("muted", []))
+    out = [dict(w, source="GitHub") for w in cfg["watch"] if watch_id(w) not in muted]
+    for tw in state.get("tg_watches", []):
+        w = dict(tw, date=date.fromisoformat(tw["date"]), source="Telegram")
+        if watch_id(w) not in {watch_id(x) for x in out}:
+            out.append(w)
+    today = now_sg().date()
+    return sorted([w for w in out if w["date"] >= today], key=lambda w: (w["date"], w["direction"], w["earliest"]))
+
+
+def tg_get_commands(cfg: dict, state: dict) -> list[str]:
+    tok, chat = cfg["telegram"].get("bot_token"), str(cfg["telegram"].get("chat_id") or "")
+    if not tok or not chat:
+        return []
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{tok}/getUpdates",
+                         params={"offset": state.get("tg_offset", 0), "timeout": 0}, timeout=15).json()
+    except Exception as e:
+        print(f"  Couldn't read Telegram messages: {e}")
+        return []
+    cmds = []
+    for u in r.get("result", []):
+        state["tg_offset"] = u["update_id"] + 1
+        msg = u.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) != chat:
+            continue  # ignore anyone who isn't you
+        text = (msg.get("text") or "").strip()
+        if text:
+            cmds.append(text)
+    return cmds
+
+
+def format_seats(w: dict, trips: list[dict]) -> str:
+    head = f"🚆 {PRETTY[w['direction']]}, {w['date']:%a %d %b %Y}"
+    if not trips:
+        return head + "\nNo trains found for that day."
+    rows = [f"{t['time']}  {'✅ ' + str(t['seats']) + ' seats' if t['seats'] else '❌ full'}" for t in trips]
+    free = sum(1 for t in trips if t["seats"])
+    return f"{head}\n" + "\n".join(rows) + f"\n\n{free} of {len(trips)} trains have seats.\nBook: {SHUTTLE_URL}"
+
+
+def handle_commands(cfg: dict, state: dict, page: Page, pax: int, date_fmt: str) -> None:
+    for text in tg_get_commands(cfg, state):
+        print(f"  Telegram: {text!r}")
+        parts = text.split()
+        cmd = parts[0].lower().split("@")[0]
+        args = parts[1:]
+        if cmd in ("/start", "/help", "help"):
+            tg_send(cfg, HELP)
+        elif cmd == "/list":
+            ws = all_watches(cfg, state)
+            if not ws:
+                tg_send(cfg, "I'm not watching any trips. Add one with e.g. /watch 3 Oct SG")
+            else:
+                tg_send(cfg, "👀 Watching:\n" + "\n".join(f"{i}. {describe(w)}" for i, w in enumerate(ws, 1))
+                        + "\n\nStop one with /stop <number>")
+        elif cmd == "/stop":
+            ws = all_watches(cfg, state)
+            if not args or not args[0].isdigit() or not (1 <= int(args[0]) <= len(ws)):
+                tg_send(cfg, "Send /list first, then e.g. /stop 2")
+                continue
+            w = ws[int(args[0]) - 1]
+            wid = watch_id(w)
+            state["tg_watches"] = [x for x in state.get("tg_watches", [])
+                                   if watch_id(dict(x, date=date.fromisoformat(x["date"]))) != wid]
+            if w["source"] == "GitHub":
+                state.setdefault("muted", []).append(wid)
+            tg_send(cfg, f"🛑 Stopped watching {describe(w)}")
+        elif cmd in ("/watch", "/check"):
+            d, rest = parse_date(args)
+            direction = parse_dir(rest[0] if rest else None)
+            window = parse_window(rest[1] if len(rest) > 1 else None)
+            if not d or not direction or not window:
+                example = "/watch 3 Oct JB 17:00-22:00" if cmd == "/watch" else "/check 3 Oct SG"
+                tg_send(cfg, f"I didn't understand that. Try e.g. {example}\nSend /help for all commands.")
+                continue
+            if d < now_sg().date():
+                tg_send(cfg, f"{d:%d %b %Y} has already passed.")
+                continue
+            w = {"direction": direction, "date": d, "earliest": window[0], "latest": window[1]}
+            if cmd == "/check":
+                try:
+                    trips = check_trip(page, dict(w, earliest="00:00", latest="23:59"), pax, date_fmt)
+                    tg_send(cfg, format_seats(w, trips))
+                except Exception as e:
+                    tg_send(cfg, f"⚠ Couldn't check KTMB just now ({e}). I'll try again if you resend.")
+            else:
+                if watch_id(w) in {watch_id(x) for x in all_watches(cfg, state)}:
+                    tg_send(cfg, f"I'm already watching {describe(w)}")
+                    continue
+                state.setdefault("tg_watches", []).append(dict(w, date=d.isoformat()))
+                state["muted"] = [m for m in state.get("muted", []) if m != watch_id(w)]
+                tg_send(cfg, f"👀 Now watching {describe(w)}\nI'll message you whenever a train in that window gets seats.")
+        else:
+            tg_send(cfg, "Send /help to see what I can do.")
+        time.sleep(random.uniform(2, 4))
+    # tidy up trips whose date has passed
+    today = now_sg().date()
+    state["tg_watches"] = [x for x in state.get("tg_watches", []) if date.fromisoformat(x["date"]) >= today]
+
+
+# ----------------------------------------------------------------------------- main loop
 def run(cfg: dict, once: bool, show_browser: bool, state_path: Path | None = None) -> None:
     s = cfg["settings"]
     pax = int(s.get("passengers", 1))
     every = max(float(s.get("check_every_minutes", 5)), MIN_INTERVAL_MIN)
     date_fmt = s.get("date_format", "%d %b %Y")
     headless = not show_browser and bool(s.get("headless", True))
-    last: dict[str, int] = {}   # key -> seats last time
-    fails = 0
-    alerted_broken = False
+    state: dict = {}
     if state_path and state_path.exists():
         try:
-            st = json.loads(state_path.read_text())
-            last, fails, alerted_broken = st.get("last", {}), st.get("fails", 0), st.get("alerted_broken", False)
+            state = json.loads(state_path.read_text())
         except Exception:
-            pass
+            state = {}
+    last: dict[str, int] = state.setdefault("last", {})   # key -> seats last time
+
+    def save() -> None:
+        if state_path:
+            today = now_sg().date().isoformat()
+            # forget seat history for dates that have passed
+            state["last"] = {k: v for k, v in last.items() if k.split("|")[1] >= today}
+            state_path.write_text(json.dumps(state, indent=1, sort_keys=True, ensure_ascii=False))
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         ctx = browser.new_context(locale="en-GB", viewport={"width": 1280, "height": 900})
         page = ctx.new_page()
         if not once:
+            ws = all_watches(cfg, state)
             tg_send(cfg, "🚆 KTM seat watcher started. Watching:\n" +
-                    "\n".join("• " + describe(w) for w in cfg["watch"]))
+                    ("\n".join("• " + describe(w) for w in ws) or "nothing yet — send /help"))
         while True:
-            today = date.today()
-            active = [w for w in cfg["watch"] if w["date"] >= today]
+            handle_commands(cfg, state, page, pax, date_fmt)
+            active = all_watches(cfg, state)
             if not active:
-                print("All watched dates have passed. Stopping.")
-                tg_send(cfg, "🚆 KTM seat watcher stopped: all watched dates have passed.")
-                break
+                print("Nothing to watch right now. Send /watch to the bot on Telegram, or add a trip to config.toml.")
             round_ok = True
             for w in active:
-                print(f"[{datetime.now():%H:%M:%S}] Checking {describe(w)} ...")
+                print(f"[{now_sg():%H:%M:%S} SGT] Checking {describe(w)} ...")
                 try:
                     trips = check_trip(page, w, pax, date_fmt)
                 except (SetupError, PWTimeout) as e:
@@ -424,26 +622,28 @@ def run(cfg: dict, once: bool, show_browser: bool, state_path: Path | None = Non
                 newly_open = []
                 for t in trips:
                     key = f"{w['direction']}|{w['date']}|{t['time']}"
-                    seats = t["seats"]
-                    print(f"  {t['time']}  seats: {seats}")
-                    if seats >= pax and last.get(key, -1) < pax:
+                    print(f"  {t['time']}  seats: {t['seats']}")
+                    if t["seats"] >= pax and last.get(key, -1) < pax:
                         newly_open.append(t)
-                    last[key] = seats
+                    else:
+                        last[key] = t["seats"]
                 if newly_open:
                     lines = "\n".join(f"• {t['time']} — {t['seats']} seat(s)" for t in newly_open)
-                    tg_send(cfg, f"✅ Seats available!\n{PRETTY[w['direction']]}, {w['date']:%a %d %b %Y}\n"
-                                 f"{lines}\n\nBook now: {SHUTTLE_URL}")
+                    sent = tg_send(cfg, f"✅ Seats available!\n{PRETTY[w['direction']]}, {w['date']:%a %d %b %Y}\n"
+                                        f"{lines}\n\nBook now: {SHUTTLE_URL}")
+                    if sent:  # only remember these once you've actually been told
+                        for t in newly_open:
+                            last[f"{w['direction']}|{w['date']}|{t['time']}"] = t["seats"]
                 time.sleep(random.uniform(4, 9))  # small gap between searches
-            fails = 0 if round_ok else fails + 1
-            if fails >= 3 and not alerted_broken:
+            fails = 0 if round_ok else state.get("fails", 0) + 1
+            state["fails"] = fails
+            if fails >= 3 and not state.get("alerted_broken"):
                 tg_send(cfg, "⚠ KTM seat watcher keeps failing to read the KTMB site. "
-                             "Check the window on your computer / the debug folder.")
-                alerted_broken = True
+                             "Open the latest run on GitHub (Actions tab) to see why.")
+                state["alerted_broken"] = True
             if round_ok:
-                alerted_broken = False
-            if state_path:
-                state_path.write_text(json.dumps(
-                    {"last": last, "fails": fails, "alerted_broken": alerted_broken}, indent=1, sort_keys=True))
+                state["alerted_broken"] = False
+            save()
             if once:
                 break
             wait = every * 60 * random.uniform(0.85, 1.15)
