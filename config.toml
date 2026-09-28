@@ -19,3 +19,9 @@ direction = "JB_TO_SG"
 date      = "2026-10-03"
 earliest  = "17:00"
 latest    = "22:00"
+
+[[watch]]
+direction = "SG_TO_JB"
+date      = "2026-10-03"
+earliest  = "17:00"
+latest    = "23:59"
