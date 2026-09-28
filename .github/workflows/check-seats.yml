@@ -2,7 +2,7 @@ name: Check KTM seats
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may run it a bit later than this)
+    - cron: "*/15 * * * *"   # every 5 minutes (GitHub may run it a bit later than this)
   workflow_dispatch:         # lets you press "Run workflow" by hand
 
 permissions:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
 
@@ -33,7 +33,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python ktm_watch.py --once --state state.json
+                run: python ktm_watch.py --minutes 45 --state state.json
 
       - name: Keep screenshots if the page couldn't be read
         if: always()
